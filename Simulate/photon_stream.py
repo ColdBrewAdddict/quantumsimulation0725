@@ -1,115 +1,73 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit, OptimizeWarning
+from scipy.constants import h, c
 import csv
 import warnings
 
+#REFERENCE: https://www.researchgate.net/publication/330429i600_Behavioral_Modeling_of_Photon_Arrival_Time_for_Time-of-Flight_Measurement_Circuit_Simulation
+
 #constants
-acquisition_time = 0.01  #10ms
-repetition_rate = 5_000_000 #5Mhz
+acquisition_time = 10e-3  #10ms
+repetition_rate = 5e6 #5Mhz
+pump_power = 0.29*1e-3  #0.29Mhz
 pulses = int(acquisition_time * repetition_rate) #Total laser pulses
-jitter = 0.3e-9  #timing uncertainty of SPAD (in Gaussian); μ = tof
+jitter = 0.3e-9  #timing uncertainty of SPAD (in Gaussian); μ += tof
 acquisition_window_ns = acquisition_time * 1e9
 DCR = 20000
-
-
+detector_eff = 0.45
+lambda_p = 940e-9 #wavelength
+h
+def photon_per_pulse():
+    count = (pump_power*lambda_p)/(h*c*repetition_rate)
+    return count
 
 def gaussian(x, a, mu, sigma):
     return a * np.exp(- (x - mu) ** 2 / (2 * sigma ** 2))
 
 
-def arrival_estimation(QE1, tof, SR, dark_arrival_ns, tau_laser_mean, laser_pulse_duration, tau_amb_mean, window_start, window_end, seed=None,
-                       bin_width=0.1, fit_bins=7):
+def arrival_estimation(QE1, tof, SR, tau_amb_mean, window_start, window_end,  DE, seed=None, bin_width=0.1, fit_bins=7):
     if seed is not None:
         np.random.seed(seed)
 
-    expected_photons = np.random.binomial(n=pulses, p=SR)
-    raw_depth = tof + np.random.normal(0, jitter, size=expected_photons)  # full array of photon arrival times
-    detected_signal = np.random.rand(len(raw_depth)) < QE1
-    signal_arrival = raw_depth[detected_signal]
+    count = photon_per_pulse()
 
-    # First laser photon with Gaussian jitter
-    if len(signal_arrival) == 0:
-        return (np.nan, np.nan, [], [])
+    #everything is in second
+    total_eff = QE1 * DE
+    lambda_sig = total_eff * SR * count * pulses  #counts per sec [poisson]
 
-    first_laser_arrival = tof + np.random.normal(0, jitter)
-    laser_arrivals = [first_laser_arrival]
+    window_duration = window_end - window_start
+    lambda_dark = DCR * window_duration
 
-    # Step 2: Generate additional laser photons within pulse duration using exponential intervals
-    current_time = first_laser_arrival
-    pulse_end_time = first_laser_arrival + laser_pulse_duration
+    num_signal = np.random.poisson(lambda_sig)
+    num_dark = np.random.poisson(lambda_dark)
 
-    while True:
-        # Generate next photon with exponential interval
-        interval = np.random.exponential(tau_laser_mean)
-        next_arrival = current_time + interval
+    signal_arrivals = tof + np.random.normal(0, jitter, size=num_signal) #array
 
-        # Stop if we exceed the pulse duration
-        if next_arrival > pulse_end_time:
-            break
-
-        laser_arrivals.append(next_arrival)
-        current_time = next_arrival
-
-    laser_arrivals = np.array(laser_arrivals)
-        
-    # Step 3: Generate ambient photons across entire measurement window
     ambient_arrivals = []
     current_time = window_start
-    
     while current_time < window_end:
-        # Generate next ambient photon with exponential interval
         interval = np.random.exponential(tau_amb_mean)
         next_arrival = current_time + interval
-        
         if next_arrival > window_end:
             break
-            
         ambient_arrivals.append(next_arrival)
         current_time = next_arrival
-    
-    ambient_arrivals = np.array(ambient_arrivals)
-    
-    # Step 4: Apply quantum efficiency to laser and ambient photons
-    laser_detected_mask = np.random.rand(len(laser_arrivals)) < QE1
-    laser_detected = laser_arrivals[laser_detected_mask]
-    
-    if len(ambient_arrivals) > 0:
-        ambient_detected_mask = np.random.rand(len(ambient_arrivals)) < QE1
-        ambient_detected = ambient_arrivals[ambient_detected_mask]
-    else:
-        ambient_detected = np.array([])
-    
-    # Step 5: Apply quantum efficiency to dark counts (already in ns)
-    dark_arrivals_s = dark_arrivals / 1e9  # Convert to seconds
-    if len(dark_arrivals_s) > 0:
-        dark_detected_mask = np.random.rand(len(dark_arrivals_s)) < QE1
-        dark_detected = dark_arrivals_s[dark_detected_mask]
-    else:
-        dark_detected = np.array([])
-    
-    # Step 6: Combine all detected photons and convert to nanoseconds
-    all_detected = []
-    if len(laser_detected) > 0:
-        all_detected.append(laser_detected)
-    if len(ambient_detected) > 0:
-        all_detected.append(ambient_detected)
-    if len(dark_detected) > 0:
-        all_detected.append(dark_detected)
-    
-    if len(all_detected) == 0:
-        return (np.nan, np.nan, [], [], [])
-    
-    all_arrivals_s = np.concatenate(all_detected)
-    all_arrivals_ns = all_arrivals_s * 1e9
+
+    dark_arrivals = np.random.uniform(window_start, window_end, size=num_dark)
+
+        # Combine & sort
+    all_arrivals = np.concatenate([signal_arrivals, ambient_arrivals, dark_arrivals])
+    all_arrivals.sort()  # stable sort for tagged events if needed
+    all_arrivals_ns = all_arrivals*1e9
 
     bins = np.arange(0, (window_end * 1e9) + bin_width, bin_width)
-    hist, bin_edges = np.histogram(all_arrivals, bins=bins)
+    hist, bin_edges = np.histogram(all_arrivals_ns, bins=bins)
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
     # Fit Gaussian to peak region
     if not np.any(hist):
-        estimated_tof = np.nan  # No photons detected
+        estimated_tof = np.nan
     else:
         peak_index = np.argmax(hist)
         half_width = fit_bins // 2
@@ -119,17 +77,16 @@ def arrival_estimation(QE1, tof, SR, dark_arrival_ns, tau_laser_mean, laser_puls
 
         try:
             with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category= OptimizeWarning)
+                warnings.simplefilter("ignore", category=OptimizeWarning)
                 p0 = [np.max(y_fit), bin_centers[peak_index], bin_width * 2]
                 popt, _ = curve_fit(gaussian, x_fit, y_fit, p0=p0)
-                estimated_tof = popt[1]  # μ (mean) is the TOF estimate
+                estimated_tof = popt[1]
         except (RuntimeError, ValueError):
-            estimated_tof = bin_centers[peak_index]  # Fallback to histogram peak
+            estimated_tof = bin_centers[peak_index]
 
-    return (estimated_tof, first_laser_arrival * 1e9, ambient_arrivals)
-
+    return estimated_tof, num_signal, num_dark, all_arrivals_ns
 #csv file
-with open("tof_trials_results.csv", mode="w", newline="") as file:
+with open("tof_trials_results0.csv", mode="w", newline="") as file:
     writer = csv.writer(file)
     writer.writerow([
         "Trial",
@@ -139,8 +96,6 @@ with open("tof_trials_results.csv", mode="w", newline="") as file:
         "QE",
         "Signal Photons",
         "Background Photons",
-        "Dark Counts",
-        "First laser photon arrival (ns)",
         "Number of simulated ambient photons",
         "Est. TOF (ns)",
         "True TOF (ns)",
@@ -152,58 +107,37 @@ with open("tof_trials_results.csv", mode="w", newline="") as file:
     for trial in range(1, 31):
         subject_reflectivity = np.random.uniform(0.05, 0.75)
         distance = np.random.uniform(1, 5)
-        b_s_ratio = np.random.uniform(60, 80) #60-80 : 1
-        quantum_efficiency = np.random.uniform(0.2, 0.7)
+        n_s = np.random.uniform(60, 80) #60-80 : 1
+        quantum_eff = np.random.uniform(0.2, 0.7)
 
-        expected_photons = np.random.binomial(n=pulses, p=subject_reflectivity)
+        window_start_s = 0.0
+        window_end_s = acquisition_time
+
+        count = photon_per_pulse()
+        total_eff = quantum_eff * detector_eff
+        lambda_sig = total_eff * subject_reflectivity * count * pulses  # counts per sec [poisson]
+        signal_rate = lambda_sig / acquisition_time
+        background_rate = n_s * signal_rate
+        tau_amb_mean = 1.0 / background_rate
+
         true_TOF = (2*distance)/3e8
-        raw_depth = true_TOF + np.random.normal(0, jitter, size=expected_photons)  # full array of photon arrival times
-
-        detected_signal = np.random.rand(len(raw_depth)) < quantum_efficiency
-        signal_arrival = raw_depth[detected_signal]
-
-        background_noise = int(b_s_ratio * len(signal_arrival))
-        background_arrivals = np.random.uniform(0, acquisition_time*1e9, background_noise)
-        background_mask = np.random.rand(background_noise) < quantum_efficiency
-        background_arrivals = background_arrivals[background_mask]
-        dark_counts = int(DCR * acquisition_time) #expected in the situation
-        dark_arrivals = np.random.uniform(0, acquisition_time * 1e9, dark_counts)
-        dark_mask = np.random.rand(dark_counts) < quantum_efficiency
-        dark_arrivals = dark_arrivals[dark_mask]
-
-        all_arrivals = np.concatenate([signal_arrival*1e9, background_arrivals, dark_arrivals])
-
-
-        #Calculation of time duration
-        signal_arrival_sorted = np.sort(signal_arrival) #ensure in time order
-        signal_intervals = np.diff(signal_arrival_sorted) * 1e9
-        avg_signal_interval = np.mean(signal_intervals)
-        background_sorted = np.sort(background_arrivals)
-        background_intervals = np.diff(background_sorted)
-        avg_background_interval = (acquisition_time) / len(background_arrivals)
-
-        min_arrival = signal_arrival_sorted[0]
-        max_arrival = signal_arrival_sorted[-1]
-        pulse_duration = (max_arrival - min_arrival)  # in seconds
-
-        measurement_window_start_s = 0.0
-        measurement_window_end_s = acquisition_time
 
         # Run simulation
         (estimated_tof,
-         first_laser_photon,
-         simulated_ambient_photons) = arrival_estimation(
-         quantum_efficiency,
+         num_signal,
+         num_dark,
+         all_arrivals_ns) = arrival_estimation(
+         quantum_eff,
          true_TOF,
          subject_reflectivity,
-         dark_arrivals,
-         avg_signal_interval,
-         pulse_duration,
-         avg_background_interval,
-         measurement_window_start_s,
-         measurement_window_end_s,
+         tau_amb_mean,
+         window_start_s,
+         window_end_s,
+         detector_eff,
          seed=123 # Different seed for this part to differentiate from the initial setup
         )
+
+        N_background = num_signal * n_s
 
         percent_error = (abs(estimated_tof - (true_TOF*1e9))/(true_TOF*1e9))*100
 
@@ -211,23 +145,23 @@ with open("tof_trials_results.csv", mode="w", newline="") as file:
                 trial,
                 f"{distance:.3f}",
                 f"{subject_reflectivity:.3f}",
-                f"{b_s_ratio:.1f}",
-                f"{quantum_efficiency:.3f}",
-                len(signal_arrival),
-                len(background_arrivals),
-                len(dark_arrivals),
-                f"{first_laser_photon :.3f}",
-                len(simulated_ambient_photons),
+                f"{n_s:.1f}",
+                f"{quantum_eff:.3f}",
+                int(num_signal),
+                int(N_background),
+                int(num_dark),
                 f"{estimated_tof:.3f}",
                 f"{true_TOF * 1e9:.3f}",
-                f"{percent_error:.3f}"
+                f"{percent_error:.3f}%"
             ])
 
-
         #histogram
+        bin_width = 0.5  # ns
+        bin_edges = np.arange(0, acquisition_window_ns + bin_width, bin_width)
+
         plt.figure(figsize=(8, 5))
-        plt.hist(all_arrivals, bins=100, range=(0, acquisition_window_ns), color='skyblue', edgecolor='black')
-        plt.axvline(true_TOF*1e9, color='red', linestyle='--', linewidth=2, label='True TOF (~10ns)')
+        plt.hist(all_arrivals_ns, bins=bin_edges, range=(0, acquisition_window_ns), color='skyblue', edgecolor='black')
+        plt.axvline(true_TOF*1e9, color='red', linestyle='--', linewidth=2, label=f'True TOF ({true_TOF*1e9:.3f}ns)')
         if not np.isnan(estimated_tof):
             plt.axvline(estimated_tof, color = 'green', linestyle=':', linewidth=2, label=f'Estimated TOF ({estimated_tof:.1f}ns)')
         plt.title("Simulated Photon Arrival Times in High Noise Environment")
